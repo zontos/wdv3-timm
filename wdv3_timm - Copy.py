@@ -1,7 +1,6 @@
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
-import json
 
 import numpy as np
 import pandas as pd
@@ -24,8 +23,10 @@ MODEL_REPO_MAP = {
 
 
 def pil_ensure_rgb(image: Image.Image) -> Image.Image:
+    # convert to RGB/RGBA if not already (deals with palette images etc.)
     if image.mode not in ["RGB", "RGBA"]:
         image = image.convert("RGBA") if "transparency" in image.info else image.convert("RGB")
+    # convert RGBA to RGB with white background
     if image.mode == "RGBA":
         canvas = Image.new("RGBA", image.size, (255, 255, 255))
         canvas.alpha_composite(image)
@@ -35,7 +36,9 @@ def pil_ensure_rgb(image: Image.Image) -> Image.Image:
 
 def pil_pad_square(image: Image.Image) -> Image.Image:
     w, h = image.size
+    # get the largest dimension so we can pad to a square
     px = max(image.size)
+    # pad to square with white background
     canvas = Image.new("RGB", (px, px), (255, 255, 255))
     canvas.paste(image, ((px - w) // 2, (px - h) // 2))
     return canvas
@@ -49,9 +52,15 @@ class LabelData:
     character: list[np.int64]
 
 
-def load_labels_hf(repo_id: str, revision: Optional[str] = None, token: Optional[str] = None) -> LabelData:
+def load_labels_hf(
+    repo_id: str,
+    revision: Optional[str] = None,
+    token: Optional[str] = None,
+) -> LabelData:
     try:
-        csv_path = hf_hub_download(repo_id=repo_id, filename="selected_tags.csv", revision=revision, token=token)
+        csv_path = hf_hub_download(
+            repo_id=repo_id, filename="selected_tags.csv", revision=revision, token=token
+        )
         csv_path = Path(csv_path).resolve()
     except HfHubHTTPError as e:
         raise FileNotFoundError(f"selected_tags.csv failed to download from {repo_id}") from e
@@ -67,21 +76,33 @@ def load_labels_hf(repo_id: str, revision: Optional[str] = None, token: Optional
     return tag_data
 
 
-def get_tags(probs: Tensor, labels: LabelData, gen_threshold: float, char_threshold: float):
+def get_tags(
+    probs: Tensor,
+    labels: LabelData,
+    gen_threshold: float,
+    char_threshold: float,
+):
+    # Convert indices+probs to labels
     probs = list(zip(labels.names, probs.numpy()))
 
+    # First 4 labels are actually ratings
     rating_labels = dict([probs[i] for i in labels.rating])
+
+    # General labels, pick any where prediction confidence > threshold
     gen_labels = [probs[i] for i in labels.general]
     gen_labels = dict([x for x in gen_labels if x[1] > gen_threshold])
     gen_labels = dict(sorted(gen_labels.items(), key=lambda item: item[1], reverse=True))
 
+    # Character labels, pick any where prediction confidence > threshold
     char_labels = [probs[i] for i in labels.character]
     char_labels = dict([x for x in char_labels if x[1] > char_threshold])
     char_labels = dict(sorted(char_labels.items(), key=lambda item: item[1], reverse=True))
 
+    # Combine general and character labels, sort by confidence
     combined_names = [x for x in gen_labels]
     combined_names.extend([x for x in char_labels])
 
+    # Convert to a string suitable for use as a training caption
     caption = ", ".join(combined_names)
     taglist = caption.replace("_", " ").replace("(", "\(").replace(")", "\)")
 
@@ -114,19 +135,28 @@ def main(opts: ScriptOptions):
     transform = create_transform(**resolve_data_config(model.pretrained_cfg, model=model))
 
     print("Loading image and preprocessing...")
+    # get image
     img_input: Image.Image = Image.open(image_path)
+    # ensure image is RGB
     img_input = pil_ensure_rgb(img_input)
+    # pad to square with white background
     img_input = pil_pad_square(img_input)
+    # run the model's input transform to convert to tensor and rescale
     inputs: Tensor = transform(img_input).unsqueeze(0)
+    # NCHW image RGB to BGR
     inputs = inputs[:, [2, 1, 0]]
 
     print("Running inference...")
     with torch.inference_mode():
+        # move model to GPU, if available
         if torch_device.type != "cpu":
             model = model.to(torch_device)
             inputs = inputs.to(torch_device)
+        # run the model
         outputs = model.forward(inputs)
+        # apply the final activation function (timm doesn't support doing this internally)
         outputs = F.sigmoid(outputs)
+        # move inputs, outputs, and model back to to cpu if we were on GPU
         if torch_device.type != "cpu":
             inputs = inputs.to("cpu")
             outputs = outputs.to("cpu")
@@ -140,19 +170,25 @@ def main(opts: ScriptOptions):
         char_threshold=opts.char_threshold,
     )
 
-    results = {
-        "caption": caption,
-        "tags": taglist,
-        "ratings": {k: float(v) for k, v in ratings.items()},
-        "character_tags": {k: float(v) for k, v in character.items()},
-        "general_tags": {k: float(v) for k, v in general.items()},
-    }
+    print("--------")
+    print(f"Caption: {caption}")
+    print("--------")
+    print(f"Tags: {taglist}")
 
-    json_output = json.dumps(results, indent=4)
-    print(json_output)
+    print("--------")
+    print("Ratings:")
+    for k, v in ratings.items():
+        print(f"  {k}: {v:.3f}")
 
-    with open("output.json", "w") as f:
-        f.write(json_output)
+    print("--------")
+    print(f"Character tags (threshold={opts.char_threshold}):")
+    for k, v in character.items():
+        print(f"  {k}: {v:.3f}")
+
+    print("--------")
+    print(f"General tags (threshold={opts.gen_threshold}):")
+    for k, v in general.items():
+        print(f"  {k}: {v:.3f}")
 
     print("Done!")
 
